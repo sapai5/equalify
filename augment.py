@@ -1,300 +1,92 @@
-import eventlet
-eventlet.monkey_patch()
-from flask import Flask, render_template
-from flask_socketio import SocketIO, emit
-import pandas as pd
-import numpy as np
-from scipy.signal import find_peaks
-from sklearn.ensemble import RandomForestRegressor
-import matplotlib.pyplot as plt
-import boto3
-from botocore.exceptions import ClientError, NoCredentialsError
-import io
-import base64
-import os
-from flask_cors import CORS
-import warnings
-from sklearn.preprocessing import MinMaxScaler
+from pymongo.mongo_client import MongoClient
+from pymongo.server_api import ServerApi
 from dotenv import load_dotenv
+import os
+from openai import OpenAI
+from tqdm import tqdm
+from pydantic import BaseModel, Field
+from typing import Optional
 
-# Load environment variables from .env file if it exists
+# Load environment variables
 load_dotenv()
 
-# Function to validate and get AWS credentials
-def get_aws_credentials():
-    # Try getting from environment variables
-    credentials = {
-        "AWS_ACCESS_KEY_ID": os.getenv("AWS_ACCESS_KEY_ID"),
-        "AWS_SECRET_ACCESS_KEY": os.getenv("AWS_SECRET_ACCESS_KEY"),
-        "AWS_REGION": os.getenv("AWS_REGION")
-    }
+# Set up MongoDB connection
+MONGO_URI = os.getenv('MONGO_URI')
+client = MongoClient(MONGO_URI, server_api=ServerApi('1'))
+db = client['scholarship_db']
+scholarships = db['scholarships']
 
-    # Check if any credentials are missing
-    missing_credentials = [key for key, value in credentials.items() if not value]
-
-    if missing_credentials:
-        raise Exception(f"Missing required AWS credentials: {', '.join(missing_credentials)}")
-
-    return credentials
-
-
-warnings.filterwarnings('ignore')
-
-app = Flask(__name__)
-CORS(app, resources={
-    r"/*": {
-        "origins": "*",
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type"],
-        "supports_credentials": False
-    }
-})
-
-socketio = SocketIO(
-    app,
-    cors_allowed_origins="*",
-    async_mode='eventlet',
-    ping_timeout=60,
-    ping_interval=25,
-    logger=True,
-    engineio_logger=True,
-    always_connect=True
-)
-
-
-def custom_percent_accuracy(y_true, y_pred):
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    max_val = np.max(y_true)
-    return 100 * (1 - np.mean(np.abs(y_true - y_pred) / max_val))
-
-
-def analyze_peaks(data):
-    """Analyze peak characteristics of the time series."""
-    clean_data = np.nan_to_num(data, nan=np.nanmean(data))
-    peaks, _ = find_peaks(clean_data, height=np.nanmean(clean_data), distance=20)
-    if len(peaks) == 0:
-        return np.nanmean(clean_data), 20
-    peak_heights = clean_data[peaks]
-    avg_peak_height = np.nanmean(peak_heights)
-    avg_peak_distance = np.nanmean(np.diff(peaks)) if len(peaks) > 1 else 20
-    return float(avg_peak_height), float(avg_peak_distance)
-
-
-def generate_synthetic_peaks(length, avg_height, avg_distance, noise_level=0.2):
-    """Generate synthetic peaks with similar characteristics to the original data."""
-    x = np.linspace(0, length, length)
-    base_signal = np.zeros(length)
-    avg_distance = max(1, int(round(avg_distance)))
-
-    for i in range(0, length, avg_distance):
-        peak_height = avg_height * (1 + np.random.normal(0, 0.2))
-        base_signal += peak_height * np.exp(-(x - i) ** 2 / (2 * (avg_distance / 5) ** 2))
-
-    noise = np.random.normal(0, noise_level * avg_height, length)
-    return base_signal + noise
-
-
-def download_and_load_data():
-    """Function to download data from S3 and load it."""
-    try:
-        # Get and validate AWS credentials
-        credentials = get_aws_credentials()
-
-        s3 = boto3.client('s3',
-                          aws_access_key_id=credentials["AWS_ACCESS_KEY_ID"],
-                          aws_secret_access_key=credentials["AWS_SECRET_ACCESS_KEY"],
-                          region_name=credentials["AWS_REGION"])
-
-        bucket_name = 'aveva-csv-bucket'
-        file_key = 'SOIL DATA GR.csv'
-
-        print(f"Attempting to access S3 bucket: {bucket_name}")
-        print(f"Attempting to read file: {file_key}")
-
-        try:
-            obj = s3.get_object(Bucket=bucket_name, Key=file_key)
-            df = pd.read_csv(io.BytesIO(obj['Body'].read()))
-            print(f"Successfully loaded data from S3. DataFrame shape: {df.shape}")
-            return df
-        except ClientError as e:
-            error_code = e.response['Error']['Code']
-            if error_code == 'NoSuchBucket':
-                raise Exception(f"S3 bucket '{bucket_name}' does not exist")
-            elif error_code == 'NoSuchKey':
-                raise Exception(f"File '{file_key}' not found in S3 bucket")
-            else:
-                raise Exception(f"AWS S3 error: {str(e)}")
-
-    except Exception as e:
-        raise Exception(str(e))
-
-
-@socketio.on('connect')
-def on_connect():
-    print("Client connected")
-    try:
-        df = download_and_load_data()
-        columns = df.columns.tolist()
-        columns.remove("ID")
-        emit('available_columns', {'columns': columns})
-        print(f"Emitted {len(columns)} columns to client")
-    except Exception as e:
-        error_msg = str(e)
-        print(f"Error in on_connect: {error_msg}")
-        emit('error', {'message': error_msg})
-
-from openai import OpenAI
-
+# Set up OpenAI API
 openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-@socketio.on('process_data')
-def handle_process_data(json):
-    try:
-        print(f"Received process_data request with data: {json}")
-        target_column = json['target_column']
-
-        print(f"Loading data for column: {target_column}")
-        df = download_and_load_data()
-        print(f"Data loaded successfully. Shape: {df.shape}")
-
-        if target_column not in df.columns:
-            error_msg = f"Column '{target_column}' not found in dataset."
-            print(error_msg)
-            emit('console_output', {'error': error_msg})
-            return
-
-        print("Processing data...")
-        # Data processing
-        df[target_column] = pd.to_numeric(df[target_column], errors='coerce')
-        df[target_column].fillna(method='ffill', inplace=True)
-        df[target_column].fillna(method='bfill', inplace=True)
-
-        print("Creating features...")
-        # Feature engineering
-        df['P_diff'] = df[target_column].diff()
-        df['P_diff'].fillna(0, inplace=True)
-
-        df['P_rolling_mean'] = df[target_column].rolling(window=5, min_periods=1).mean()
-        df['P_rolling_std'] = df[target_column].rolling(window=5, min_periods=1).std()
-        df['P_rolling_std'].fillna(df[target_column].std(), inplace=True)
-
-        print("Analyzing peaks...")
-        # Analyze peak characteristics
-        avg_peak_height, avg_peak_distance = analyze_peaks(df[target_column].values)
-
-        print("Preparing features and target...")
-        # Prepare features and target
-        features = df[['P_diff', 'P_rolling_mean', 'P_rolling_std']].values
-        target = df[target_column].values.reshape(-1, 1)
-
-        # Scale the data
-        scaler_features = MinMaxScaler()
-        scaler_target = MinMaxScaler()
-
-        features_scaled = scaler_features.fit_transform(features)
-        target_scaled = scaler_target.fit_transform(target)
-
-        print("Training model...")
-        # Train model
-        model = RandomForestRegressor(n_estimators=100, random_state=42)
-        model.fit(features_scaled, target_scaled.ravel())
-
-        print("Generating predictions...")
-        # Generate predictions for existing data
-        predictions_scaled = model.predict(features_scaled)
-        predictions = scaler_target.inverse_transform(predictions_scaled.reshape(-1, 1)).ravel()
-
-        print("Generating future predictions...")
-        # Generate future predictions
-        future_entries = 100
-        synthetic_data = generate_synthetic_peaks(future_entries, avg_peak_height, avg_peak_distance)
-
-        # Create features for future predictions
-        future_features = np.zeros((future_entries, 3))
-        future_features[:, 0] = np.diff(synthetic_data, prepend=target[-1])
-        future_features[:, 1] = pd.Series(synthetic_data).rolling(window=5, min_periods=1).mean()
-        future_features[:, 2] = pd.Series(synthetic_data).rolling(window=5, min_periods=1).std()
-        future_features = np.nan_to_num(future_features, nan=0)
-
-        # Scale future features and generate predictions
-        future_features_scaled = scaler_features.transform(future_features)
-        future_predictions_scaled = model.predict(future_features_scaled)
-        future_predictions = scaler_target.inverse_transform(future_predictions_scaled.reshape(-1, 1)).ravel()
-
-        print("Preparing chart data...")
-        # Prepare data for Recharts
-        chart_data = []
-        for i, (actual, predicted) in enumerate(zip(df[target_column], predictions)):
-            chart_data.append({
-                "entry": i + 1,
-                "actual": float(actual),
-                "predicted": float(predicted)
-            })
-
-        # Add future predictions
-        for i, future_pred in enumerate(future_predictions):
-            chart_data.append({
-                "entry": len(df) + i + 1,
-                "actual": None,
-                "predicted": float(future_pred)
-            })
-
-        # Calculate accuracy
-        mape = custom_percent_accuracy(df[target_column], predictions)
-
-        print("Emitting results...")
-        # Emit results
-        emit('new_plot', {'data': chart_data, 'column': target_column})
-        emit('model_mae', {'mae': float(mape)})
-        emit('console_output', {'message': f"Processing complete for column: {target_column}"})
-
-        all_columns = df.columns.tolist()
-
-        prompt = f"""
-                Given the following information about mining data, please assess if it is sustainable to continue mining:
-
-                Available data columns: {', '.join(all_columns)}
-                Target column analyzed: {target_column}
-                Prediction accuracy: {mape}%
-                Number of future predictions: {len(future_predictions)}
-
-                Based on the historical data and future predictions for {target_column}, analyze the environmental impact 
-                and sustainability of continuing mining operations. Consider any trends, patterns, or concerning indicators 
-                in the data. Give a definitive yes or no answer at the end if we should continue mining. Keep the whole
-                response under 100 words.
-                """
-
-        print("Process completed successfully")
-
-        response = openai_client.beta.chat.completions.parse(
-            model="gpt-4o-2024-08-06",  # Use the appropriate model that supports structured outputs
-            messages=[
-                {"role": "system", "content": "You are an AI assistant that advises on mining sustainability using provided data."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-
-        analysis = response.choices[0].message.content
-
-        print("\n=== AI Analysis ===")
-        print(analysis)
-        print("==================\n")
-
-        emit('console_output', {
-            'message': f"""
-                    Analysis for {target_column}:
-
-                    {analysis}
-
-                    """
-        })
-
-        print("Process completed successfully")
 
 
-    except Exception as e:
-        error_message = f'Failed to process data: {str(e)}'
-        print(f"Error in handle_process_data: {error_message}")
-        emit('error', {'message': error_message})
+# Define the structured output model
+class AugmentedScholarship(BaseModel):
+    title: str
+    is_merit_based: bool
+    preferred_ethnicity: Optional[str] = Field(None, description="Preferred ethnicity, if any")
+    preferred_gender: Optional[str] = Field(None, description="Preferred gender, if any")
+    preferred_major: Optional[str] = Field(None, description="Preferred major or field of study, if any")
+    prefers_lgbt: bool
+    university: Optional[str] = Field(None, description="Specific university, if any")
+    location: Optional[str] = Field(None, description="Location requirement, if any")
+    is_essay_required: bool
+    reward: float = Field(description="Scholarship amount in USD")
+    extra_requirements: Optional[str] = Field(None, description="Any additional requirements")
+    women_in_stem: bool
+    disabilities: bool
+    rural: bool
+    immigrant_or_refugee: bool
+    neurodiversity: bool
+    low_income: bool
+    first_generation: bool
 
-if __name__ == '__main__':
-    socketio.run(app, debug=True, allow_unsafe_werkzeug=True)
+def augment_document(doc):
+    if "name" in doc:
+        return doc
+
+    prompt = f"""
+    Given the following scholarship description, please extract or infer the required information:
+
+    Description: {doc['description']}
+
+    Provide the information in a structured format following the specified schema.
+    If a field is not applicable or the information is not provided, use null for optional fields.
+    """
+
+    response = openai_client.beta.chat.completions.parse(
+        model="gpt-4o-2024-08-06",  # Use the appropriate model that supports structured outputs
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant that extracts scholarship information."},
+            {"role": "user", "content": prompt}
+        ],
+        response_format=AugmentedScholarship
+    )
+
+    result = response.choices[0].message
+    parsed = result.parsed
+
+    # Merge the augmented data with the original document
+    doc.update(parsed)
+    return doc
+
+
+# Main execution
+if __name__ == "__main__":
+    # Get all documents from the collection
+    all_docs = list(scholarships.find())
+
+    # Process each document
+    for doc in tqdm(all_docs, desc="Processing scholarships"):
+        try:
+            augmented_doc = augment_document(doc)
+
+            # Update the document in the database
+            scholarships.update_one({"_id": doc["_id"]}, {"$set": augmented_doc})
+        except Exception as e:
+            print(f"Error processing document {doc['_id']}: {str(e)}")
+
+    print(f"Processed and updated {len(all_docs)} scholarships.")
+
+    # Close the MongoDB connection
+    client.close()
